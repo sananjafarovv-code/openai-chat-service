@@ -11,8 +11,7 @@ class MessageCreate(BaseModel):
     @field_validator("content")
     @classmethod
     def content_must_not_be_blank(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
+        if not value.strip():
             raise ValueError("Message must not be blank.")
         return value
 
@@ -21,6 +20,7 @@ class MessageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    interaction_id: str
     sequence_number: int
     role: str
     content: str

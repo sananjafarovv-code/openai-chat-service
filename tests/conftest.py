@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.api.dependencies import get_openai_client
 from app.db.base import Base
-from app.db.session import get_db
+from app.db.session import enable_sqlite_foreign_keys, get_db
 from app.main import app
 from app.services.openai_client import ChatMessage, OpenAIResult
 
@@ -37,14 +38,27 @@ def fake_openai() -> FakeOpenAIClient:
 
 
 @pytest.fixture
-def client(fake_openai: FakeOpenAIClient) -> Generator[TestClient, None, None]:
+def db_engine(tmp_path: Path) -> Generator[Engine, None, None]:
+    database_path = tmp_path / "test.db"
     engine = create_engine(
-        "sqlite://",
+        f"sqlite:///{database_path}",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
-    testing_session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    event.listen(engine, "connect", enable_sqlite_foreign_keys)
     Base.metadata.create_all(bind=engine)
+
+    yield engine
+
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+
+
+@pytest.fixture
+def client(
+    fake_openai: FakeOpenAIClient,
+    db_engine: Engine,
+) -> Generator[TestClient, None, None]:
+    testing_session = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
 
     def override_get_db() -> Generator[Session, None, None]:
         db = testing_session()
@@ -60,5 +74,3 @@ def client(fake_openai: FakeOpenAIClient) -> Generator[TestClient, None, None]:
         yield test_client
 
     app.dependency_overrides.clear()
-    Base.metadata.drop_all(bind=engine)
-    engine.dispose()

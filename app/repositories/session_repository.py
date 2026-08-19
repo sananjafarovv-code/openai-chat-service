@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Optional
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -43,6 +44,10 @@ class SessionRepository:
         )
         return list(self._db.scalars(statement))
 
+    def end_read_transaction(self) -> None:
+        """Release the database connection before a slow external API call."""
+        self._db.rollback()
+
     def save_interaction(
         self,
         session: ChatSession,
@@ -54,30 +59,43 @@ class SessionRepository:
             select(func.max(Message.sequence_number)).where(Message.session_id == session.id)
         )
         next_sequence = int(last_sequence or 0) + 1
+        interaction_id = str(uuid4())
 
         user_message = Message(
             session_id=session.id,
+            interaction_id=interaction_id,
             sequence_number=next_sequence,
             role="user",
             content=user_content,
         )
         assistant_message = Message(
             session_id=session.id,
+            interaction_id=interaction_id,
             sequence_number=next_sequence + 1,
             role="assistant",
             content=openai_result.content,
         )
         usage_record = UsageRecord(
             session_id=session.id,
+            interaction_id=interaction_id,
             model=session.model,
             input_tokens=openai_result.input_tokens,
+            cached_input_tokens=openai_result.cached_input_tokens,
+            cache_write_tokens=openai_result.cache_write_tokens,
             output_tokens=openai_result.output_tokens,
+            reasoning_tokens=openai_result.reasoning_tokens,
             total_tokens=openai_result.total_tokens,
             input_price_per_1m=pricing.input_price_per_1m,
+            cached_input_price_per_1m=pricing.cached_input_price_per_1m,
+            cache_write_price_per_1m=pricing.cache_write_price_per_1m,
             output_price_per_1m=pricing.output_price_per_1m,
+            uncached_input_cost=pricing.uncached_input_cost,
+            cached_input_cost=pricing.cached_input_cost,
+            cache_write_cost=pricing.cache_write_cost,
             input_cost=pricing.input_cost,
             output_cost=pricing.output_cost,
             total_cost=pricing.total_cost,
+            long_context_applied=pricing.long_context_applied,
             openai_response_id=openai_result.response_id,
         )
 

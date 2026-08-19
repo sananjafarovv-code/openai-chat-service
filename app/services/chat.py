@@ -8,6 +8,7 @@ from app.db.models import ChatSession, Message, UsageRecord
 from app.repositories.session_repository import SessionRepository
 from app.services.openai_client import ChatMessage, OpenAIChatClient
 from app.services.pricing import PricingService
+from app.services.session_locks import SessionLockManager
 
 
 @dataclass(frozen=True)
@@ -25,11 +26,13 @@ class ChatService:
         openai_client: OpenAIChatClient,
         pricing_service: PricingService,
         default_model: str,
+        lock_manager: SessionLockManager,
     ) -> None:
         self._repository = repository
         self._openai_client = openai_client
         self._pricing_service = pricing_service
         self._default_model = default_model
+        self._lock_manager = lock_manager
 
     def create_session(self, model: Optional[str], title: Optional[str]) -> ChatSession:
         selected_model = model or self._default_model
@@ -43,6 +46,10 @@ class ChatService:
         return session
 
     def send_message(self, session_id: str, content: str) -> Interaction:
+        with self._lock_manager.acquire(session_id):
+            return self._send_message_locked(session_id, content)
+
+    def _send_message_locked(self, session_id: str, content: str) -> Interaction:
         session = self._repository.get(session_id)
         if session is None:
             raise SessionNotFoundError(session_id)
@@ -51,12 +58,22 @@ class ChatService:
         context = [ChatMessage(role=message.role, content=message.content) for message in history]
         context.append(ChatMessage(role="user", content=content))
 
-        openai_result = self._openai_client.generate(session.model, context)
+        model = session.model
+        self._repository.end_read_transaction()
+
+        openai_result = self._openai_client.generate(model, context)
         pricing = self._pricing_service.calculate(
-            session.model,
+            model,
             input_tokens=openai_result.input_tokens,
             output_tokens=openai_result.output_tokens,
+            cached_input_tokens=openai_result.cached_input_tokens,
+            cache_write_tokens=openai_result.cache_write_tokens,
         )
+
+        session = self._repository.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id)
+
         user_message, assistant_message, usage = self._repository.save_interaction(
             session=session,
             user_content=content,
