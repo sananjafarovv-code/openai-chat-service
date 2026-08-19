@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+import time
+
 from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy.engine import Engine
 
 from app.api.dependencies import get_openai_client
-from app.core.exceptions import OpenAIServiceError
+from app.core.exceptions import (
+    OpenAIConnectionError,
+    OpenAIQuotaError,
+    OpenAIRateLimitError,
+    OpenAIServiceError,
+    OpenAITimeoutError,
+)
 from app.main import app
-from app.services.openai_client import ChatMessage
+from app.services.openai_client import ChatMessage, OpenAIResult
 from tests.conftest import FakeOpenAIClient
 
 
@@ -39,6 +51,10 @@ def test_session_keeps_context_and_accumulates_usage(
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["usage"]["total_cost"] == "0.0000080000"
+    first_payload = first.json()
+    interaction_id = first_payload["usage"]["interaction_id"]
+    assert first_payload["user_message"]["interaction_id"] == interaction_id
+    assert first_payload["assistant_message"]["interaction_id"] == interaction_id
 
     assert len(fake_openai.calls) == 2
     _, second_context = fake_openai.calls[1]
@@ -83,11 +99,61 @@ def test_blank_message_returns_422(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_message_whitespace_is_preserved(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+) -> None:
+    session_id = create_session(client)
+    content = "  code block\n    nested line  "
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": content},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user_message"]["content"] == content
+    assert fake_openai.calls[0][1][-1].content == content
+
+
+def test_database_connection_is_released_during_openai_call(
+    client: TestClient,
+    db_engine: Engine,
+) -> None:
+    session_id = create_session(client)
+
+    class ConnectionInspectingOpenAIClient:
+        def generate(self, model: str, messages: list[ChatMessage]) -> OpenAIResult:
+            assert db_engine.pool.checkedout() == 0
+            return OpenAIResult(
+                content="connection released",
+                response_id="connection_released",
+                input_tokens=10,
+                output_tokens=5,
+                total_tokens=15,
+            )
+
+    app.dependency_overrides[get_openai_client] = lambda: ConnectionInspectingOpenAIClient()
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "check the connection"},
+    )
+
+    assert response.status_code == 200
+
+
 def test_unknown_model_returns_422(client: TestClient) -> None:
     response = client.post("/sessions", json={"model": "unknown-model"})
 
     assert response.status_code == 422
     assert "Pricing is not configured" in response.json()["detail"]
+
+
+def test_blank_model_returns_422(client: TestClient) -> None:
+    response = client.post("/sessions", json={"model": "   "})
+
+    assert response.status_code == 422
 
 
 def test_openai_failure_does_not_save_partial_interaction(client: TestClient) -> None:
@@ -110,3 +176,161 @@ def test_openai_failure_does_not_save_partial_interaction(client: TestClient) ->
     assert detail.json()["messages"] == []
     assert detail.json()["usage_records"] == []
     assert detail.json()["total_cost"] == "0E-10"
+
+
+def test_different_sessions_keep_isolated_histories(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+) -> None:
+    first_session = create_session(client)
+    second_session = create_session(client)
+
+    assert client.post(
+        f"/sessions/{first_session}/messages",
+        json={"content": "first session"},
+    ).status_code == 200
+    assert client.post(
+        f"/sessions/{second_session}/messages",
+        json={"content": "second session"},
+    ).status_code == 200
+    assert client.post(
+        f"/sessions/{first_session}/messages",
+        json={"content": "continue first"},
+    ).status_code == 200
+
+    _, first_session_second_context = fake_openai.calls[2]
+    assert [(message.role, message.content) for message in first_session_second_context] == [
+        ("user", "first session"),
+        ("assistant", "Test assistant response 1"),
+        ("user", "continue first"),
+    ]
+
+
+def test_detailed_usage_is_persisted_and_priced(client: TestClient) -> None:
+    session_id = create_session(client)
+
+    class DetailedUsageOpenAIClient:
+        def generate(self, model: str, messages: list[ChatMessage]) -> OpenAIResult:
+            return OpenAIResult(
+                content="detailed response",
+                response_id="detailed_response",
+                input_tokens=100,
+                cached_input_tokens=40,
+                cache_write_tokens=10,
+                output_tokens=20,
+                reasoning_tokens=5,
+                total_tokens=120,
+            )
+
+    app.dependency_overrides[get_openai_client] = lambda: DetailedUsageOpenAIClient()
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "detailed usage"},
+    )
+
+    assert response.status_code == 200
+    usage = response.json()["usage"]
+    assert usage["cached_input_tokens"] == 40
+    assert usage["cache_write_tokens"] == 10
+    assert usage["reasoning_tokens"] == 5
+    assert usage["uncached_input_cost"] == "0.0000100000"
+    assert usage["cached_input_cost"] == "8.000E-7"
+    assert usage["cache_write_cost"] == "0.0000025000"
+    assert usage["input_cost"] == "0.0000133000"
+    assert usage["total_cost"] == "0.0000373000"
+
+    stored_usage = client.get(f"/sessions/{session_id}").json()["usage_records"][0]
+    assert stored_usage == usage
+
+
+def test_parallel_messages_in_one_session_are_serialized(client: TestClient) -> None:
+    session_id = create_session(client)
+
+    class OrderedOpenAIClient:
+        def __init__(self) -> None:
+            self.first_started = Event()
+            self.release_first = Event()
+            self.guard = Lock()
+            self.contexts: list[list[tuple[str, str]]] = []
+
+        def generate(self, model: str, messages: list[ChatMessage]) -> OpenAIResult:
+            with self.guard:
+                call_number = len(self.contexts) + 1
+                self.contexts.append([(message.role, message.content) for message in messages])
+            if call_number == 1:
+                self.first_started.set()
+                if not self.release_first.wait(timeout=3):
+                    raise RuntimeError("Concurrency test timed out.")
+            return OpenAIResult(
+                content=f"ordered response {call_number}",
+                response_id=f"ordered_{call_number}",
+                input_tokens=10,
+                output_tokens=5,
+                total_tokens=15,
+            )
+
+    ordered_openai = OrderedOpenAIClient()
+    app.dependency_overrides[get_openai_client] = lambda: ordered_openai
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            client.post,
+            f"/sessions/{session_id}/messages",
+            json={"content": "first concurrent message"},
+        )
+        assert ordered_openai.first_started.wait(timeout=2)
+        second_future = executor.submit(
+            client.post,
+            f"/sessions/{session_id}/messages",
+            json={"content": "second concurrent message"},
+        )
+
+        time.sleep(0.1)
+        assert len(ordered_openai.contexts) == 1
+        ordered_openai.release_first.set()
+        first_response = first_future.result(timeout=3)
+        second_response = second_future.result(timeout=3)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert ordered_openai.contexts[1] == [
+        ("user", "first concurrent message"),
+        ("assistant", "ordered response 1"),
+        ("user", "second concurrent message"),
+    ]
+
+    detail = client.get(f"/sessions/{session_id}").json()
+    assert [message["sequence_number"] for message in detail["messages"]] == [1, 2, 3, 4]
+    assert len(detail["usage_records"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (OpenAIQuotaError("no credits"), 503),
+        (OpenAIRateLimitError("rate limit"), 429),
+        (OpenAITimeoutError("timeout"), 504),
+        (OpenAIConnectionError("connection"), 503),
+    ],
+)
+def test_specific_openai_errors_have_stable_http_statuses(
+    client: TestClient,
+    error: OpenAIServiceError,
+    expected_status: int,
+) -> None:
+    session_id = create_session(client)
+
+    class FailingOpenAIClient:
+        def generate(self, model: str, messages: list[ChatMessage]) -> None:
+            raise error
+
+    app.dependency_overrides[get_openai_client] = lambda: FailingOpenAIClient()
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "trigger expected error"},
+    )
+
+    assert response.status_code == expected_status
+    assert client.get(f"/sessions/{session_id}").json()["messages"] == []

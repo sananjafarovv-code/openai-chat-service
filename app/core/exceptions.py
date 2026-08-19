@@ -22,3 +22,19 @@ class OpenAIConfigurationError(ApplicationError):
 
 class OpenAIServiceError(ApplicationError):
     """Raised when the upstream OpenAI request fails."""
+
+
+class OpenAITimeoutError(OpenAIServiceError):
+    """Raised when the upstream OpenAI request times out."""
+
+
+class OpenAIConnectionError(OpenAIServiceError):
+    """Raised when the OpenAI API cannot be reached."""
+
+
+class OpenAIRateLimitError(OpenAIServiceError):
+    """Raised when OpenAI rejects a request because of a rate limit."""
+
+
+class OpenAIQuotaError(OpenAIServiceError):
+    """Raised when the OpenAI project has no available API credits."""
