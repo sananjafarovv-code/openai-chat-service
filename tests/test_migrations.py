@@ -67,10 +67,14 @@ def test_migrations_build_current_schema_from_scratch(
     inspector = inspect(engine)
     message_columns = {column["name"] for column in inspector.get_columns("messages")}
     usage_columns = {column["name"] for column in inspector.get_columns("usage_records")}
+    session_columns = {column["name"] for column in inspector.get_columns("chat_sessions")}
 
     assert "interaction_id" in message_columns
+    assert "generation" in message_columns
+    assert "current_generation" in session_columns
     assert {
         "interaction_id",
+        "generation",
         "cached_input_tokens",
         "cache_write_tokens",
         "reasoning_tokens",
@@ -91,8 +95,69 @@ def test_migrations_build_current_schema_from_scratch(
             text("SELECT interaction_id FROM usage_records WHERE id = :usage_id"),
             {"usage_id": usage_id},
         ).scalar_one()
+        current_generation = connection.execute(
+            text("SELECT current_generation FROM chat_sessions WHERE id = :session_id"),
+            {"session_id": session_id},
+        ).scalar_one()
+        message_generations = list(
+            connection.execute(
+                text(
+                    "SELECT generation FROM messages WHERE session_id = :session_id "
+                    "ORDER BY sequence_number"
+                ),
+                {"session_id": session_id},
+            ).scalars()
+        )
+        usage_generation = connection.execute(
+            text("SELECT generation FROM usage_records WHERE id = :usage_id"),
+            {"usage_id": usage_id},
+        ).scalar_one()
 
     assert message_interactions == [usage_interaction, usage_interaction]
+    assert current_generation == 1
+    assert message_generations == [1, 1]
+    assert usage_generation == 1
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO messages "
+                "(id, session_id, interaction_id, generation, sequence_number, role, "
+                "content, created_at) VALUES "
+                "(:user_id, :session_id, :interaction_id, 2, 1, 'user', "
+                "'after reset', CURRENT_TIMESTAMP), "
+                "(:assistant_id, :session_id, :interaction_id, 2, 2, 'assistant', "
+                "'new response', CURRENT_TIMESTAMP)"
+            ),
+            {
+                "user_id": str(uuid4()),
+                "assistant_id": str(uuid4()),
+                "interaction_id": str(uuid4()),
+                "session_id": session_id,
+            },
+        )
+
+    command.downgrade(config, "0002_usage_cache_and_interactions")
+    with engine.connect() as connection:
+        legacy_sequences = list(
+            connection.execute(
+                text(
+                    "SELECT sequence_number FROM messages WHERE session_id = :session_id "
+                    "ORDER BY sequence_number"
+                ),
+                {"session_id": session_id},
+            ).scalars()
+        )
+        restored_totals = connection.execute(
+            text(
+                "SELECT total_input_tokens, total_output_tokens, total_cost "
+                "FROM chat_sessions WHERE id = :session_id"
+            ),
+            {"session_id": session_id},
+        ).one()
+
+    assert legacy_sequences == [1, 2, 3, 4]
+    assert tuple(restored_totals) == (10, 5, 0.000008)
 
     command.downgrade(config, "base")
     assert inspect(engine).get_table_names() == ["alembic_version"]

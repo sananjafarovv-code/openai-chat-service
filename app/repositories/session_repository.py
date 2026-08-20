@@ -5,7 +5,7 @@ from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session
 
 from app.db.models import ChatSession, Message, UsageRecord, utc_now
 from app.services.openai_client import OpenAIResult
@@ -27,20 +27,29 @@ class SessionRepository:
         self._db.refresh(session)
         return session
 
-    def get(self, session_id: str, with_details: bool = False) -> Optional[ChatSession]:
+    def get(self, session_id: str) -> Optional[ChatSession]:
         statement = select(ChatSession).where(ChatSession.id == session_id)
-        if with_details:
-            statement = statement.options(
-                selectinload(ChatSession.messages),
-                selectinload(ChatSession.usage_records),
-            )
         return self._db.scalar(statement)
 
-    def list_messages(self, session_id: str) -> list[Message]:
+    def list_messages(self, session_id: str, generation: int) -> list[Message]:
         statement = (
             select(Message)
-            .where(Message.session_id == session_id)
+            .where(
+                Message.session_id == session_id,
+                Message.generation == generation,
+            )
             .order_by(Message.sequence_number)
+        )
+        return list(self._db.scalars(statement))
+
+    def list_usage_records(self, session_id: str, generation: int) -> list[UsageRecord]:
+        statement = (
+            select(UsageRecord)
+            .where(
+                UsageRecord.session_id == session_id,
+                UsageRecord.generation == generation,
+            )
+            .order_by(UsageRecord.created_at, UsageRecord.id)
         )
         return list(self._db.scalars(statement))
 
@@ -48,15 +57,37 @@ class SessionRepository:
         """Release the database connection before a slow external API call."""
         self._db.rollback()
 
+    def reset(self, session: ChatSession) -> ChatSession:
+        session.current_generation += 1
+        session.total_input_tokens = 0
+        session.total_output_tokens = 0
+        session.total_cost = Decimal("0")
+        session.updated_at = utc_now()
+        self._db.add(session)
+
+        try:
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+        self._db.refresh(session)
+        return session
+
     def save_interaction(
         self,
         session: ChatSession,
+        generation: int,
+        model: str,
         user_content: str,
         openai_result: OpenAIResult,
         pricing: PricingBreakdown,
     ) -> tuple[Message, Message, UsageRecord]:
         last_sequence = self._db.scalar(
-            select(func.max(Message.sequence_number)).where(Message.session_id == session.id)
+            select(func.max(Message.sequence_number)).where(
+                Message.session_id == session.id,
+                Message.generation == generation,
+            )
         )
         next_sequence = int(last_sequence or 0) + 1
         interaction_id = str(uuid4())
@@ -64,6 +95,7 @@ class SessionRepository:
         user_message = Message(
             session_id=session.id,
             interaction_id=interaction_id,
+            generation=generation,
             sequence_number=next_sequence,
             role="user",
             content=user_content,
@@ -71,6 +103,7 @@ class SessionRepository:
         assistant_message = Message(
             session_id=session.id,
             interaction_id=interaction_id,
+            generation=generation,
             sequence_number=next_sequence + 1,
             role="assistant",
             content=openai_result.content,
@@ -78,7 +111,8 @@ class SessionRepository:
         usage_record = UsageRecord(
             session_id=session.id,
             interaction_id=interaction_id,
-            model=session.model,
+            generation=generation,
+            model=model,
             input_tokens=openai_result.input_tokens,
             cached_input_tokens=openai_result.cached_input_tokens,
             cache_write_tokens=openai_result.cache_write_tokens,

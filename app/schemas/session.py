@@ -37,6 +37,7 @@ class SessionSummary(BaseModel):
     id: str
     model: str
     title: Optional[str]
+    current_generation: int
     total_input_tokens: int
     total_output_tokens: int
     total_cost: Decimal
@@ -49,6 +50,7 @@ class UsageRead(BaseModel):
 
     id: str
     interaction_id: str
+    generation: int
     model: str
     input_tokens: int
     cached_input_tokens: int

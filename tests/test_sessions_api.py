@@ -6,6 +6,7 @@ import time
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.api.dependencies import get_openai_client
@@ -27,6 +28,7 @@ def create_session(client: TestClient) -> str:
     assert response.status_code == 201
     payload = response.json()
     assert payload["model"] == "gpt-5.6-luna"
+    assert payload["current_generation"] == 1
     assert payload["total_input_tokens"] == 0
     assert payload["total_output_tokens"] == 0
     assert payload["total_cost"] == "0E-10"
@@ -154,6 +156,180 @@ def test_blank_model_returns_422(client: TestClient) -> None:
     response = client.post("/sessions", json={"model": "   "})
 
     assert response.status_code == 422
+
+
+def test_message_model_override_uses_effective_model_and_pricing(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+) -> None:
+    session_id = create_session(client)
+
+    overridden = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Use Terra once", "model": "gpt-5.6-terra"},
+    )
+    defaulted = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Return to the session default"},
+    )
+
+    assert overridden.status_code == 200
+    assert overridden.json()["usage"]["model"] == "gpt-5.6-terra"
+    assert overridden.json()["usage"]["total_cost"] == "0.0000800000"
+    assert overridden.json()["session"]["model"] == "gpt-5.6-luna"
+    assert defaulted.status_code == 200
+    assert defaulted.json()["usage"]["model"] == "gpt-5.6-luna"
+    assert [call[0] for call in fake_openai.calls] == [
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+
+
+def test_unsupported_message_model_returns_422_without_openai_call(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+) -> None:
+    session_id = create_session(client)
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Do not send this", "model": "unsupported-model"},
+    )
+
+    assert response.status_code == 422
+    assert "Pricing is not configured" in response.json()["detail"]
+    assert fake_openai.calls == []
+    assert client.get(f"/sessions/{session_id}").json()["messages"] == []
+
+
+def test_blank_message_model_returns_422(client: TestClient) -> None:
+    session_id = create_session(client)
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "hello", "model": "   "},
+    )
+
+    assert response.status_code == 422
+
+
+def test_reset_starts_clean_generation_and_preserves_archived_data(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+    db_engine: Engine,
+) -> None:
+    session_id = create_session(client)
+    first = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "message before reset"},
+    )
+
+    reset = client.post(f"/sessions/{session_id}/reset")
+    after_reset = client.get(f"/sessions/{session_id}")
+    second = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "message after reset"},
+    )
+
+    assert first.status_code == 200
+    assert reset.status_code == 200
+    reset_payload = reset.json()
+    assert reset_payload["id"] == session_id
+    assert reset_payload["current_generation"] == 2
+    assert reset_payload["total_input_tokens"] == 0
+    assert reset_payload["total_output_tokens"] == 0
+    assert reset_payload["total_cost"] == "0E-10"
+
+    assert after_reset.status_code == 200
+    assert after_reset.json()["messages"] == []
+    assert after_reset.json()["usage_records"] == []
+
+    assert second.status_code == 200
+    second_payload = second.json()
+    assert second_payload["user_message"]["generation"] == 2
+    assert second_payload["user_message"]["sequence_number"] == 1
+    assert second_payload["assistant_message"]["sequence_number"] == 2
+    assert [(message.role, message.content) for message in fake_openai.calls[1][1]] == [
+        ("user", "message after reset"),
+    ]
+
+    with db_engine.connect() as connection:
+        message_generations = list(
+            connection.execute(
+                text(
+                    "SELECT generation FROM messages WHERE session_id = :session_id "
+                    "ORDER BY generation, sequence_number"
+                ),
+                {"session_id": session_id},
+            ).scalars()
+        )
+        usage_generations = list(
+            connection.execute(
+                text(
+                    "SELECT generation FROM usage_records WHERE session_id = :session_id "
+                    "ORDER BY generation"
+                ),
+                {"session_id": session_id},
+            ).scalars()
+        )
+
+    assert message_generations == [1, 1, 2, 2]
+    assert usage_generations == [1, 2]
+
+
+def test_reset_unknown_session_returns_404(client: TestClient) -> None:
+    response = client.post("/sessions/missing/reset")
+
+    assert response.status_code == 404
+
+
+def test_reset_waits_for_inflight_message_then_starts_clean_generation(
+    client: TestClient,
+) -> None:
+    session_id = create_session(client)
+
+    class BlockingOpenAIClient:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+
+        def generate(self, model: str, messages: list[ChatMessage]) -> OpenAIResult:
+            self.started.set()
+            if not self.release.wait(timeout=3):
+                raise RuntimeError("Reset concurrency test timed out.")
+            return OpenAIResult(
+                content="completed before reset",
+                response_id="before_reset",
+                input_tokens=10,
+                output_tokens=5,
+                total_tokens=15,
+            )
+
+    blocking_openai = BlockingOpenAIClient()
+    app.dependency_overrides[get_openai_client] = lambda: blocking_openai
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        message_future = executor.submit(
+            client.post,
+            f"/sessions/{session_id}/messages",
+            json={"content": "finish before reset"},
+        )
+        assert blocking_openai.started.wait(timeout=2)
+        reset_future = executor.submit(client.post, f"/sessions/{session_id}/reset")
+
+        time.sleep(0.1)
+        assert reset_future.done() is False
+        blocking_openai.release.set()
+        message_response = message_future.result(timeout=3)
+        reset_response = reset_future.result(timeout=3)
+
+    assert message_response.status_code == 200
+    assert reset_response.status_code == 200
+    assert reset_response.json()["current_generation"] == 2
+    detail = client.get(f"/sessions/{session_id}").json()
+    assert detail["messages"] == []
+    assert detail["usage_records"] == []
+    assert detail["total_cost"] == "0E-10"
 
 
 def test_openai_failure_does_not_save_partial_interaction(client: TestClient) -> None:

@@ -16,6 +16,15 @@ class PricingNotConfiguredError(ApplicationError):
         super().__init__(f"Pricing is not configured for model '{model}'.")
 
 
+class SessionGenerationConflictError(ApplicationError):
+    """Raised when a session is reset while an interaction is in progress."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(
+            f"Chat session '{session_id}' was reset while the message was being processed."
+        )
+
+
 class OpenAIConfigurationError(ApplicationError):
     """Raised when the OpenAI client cannot be configured."""
 

@@ -31,6 +31,15 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         long_context_input_multiplier=Decimal("2"),
         long_context_output_multiplier=Decimal("1.5"),
     ),
+    "gpt-5.6-terra": ModelPricing(
+        input_per_1m=Decimal("2.00"),
+        cached_input_per_1m=Decimal("0.20"),
+        cache_write_per_1m=Decimal("2.50"),
+        output_per_1m=Decimal("12.00"),
+        long_context_threshold=272_000,
+        long_context_input_multiplier=Decimal("2"),
+        long_context_output_multiplier=Decimal("1.5"),
+    ),
 }
 
 

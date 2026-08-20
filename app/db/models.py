@@ -31,6 +31,7 @@ class ChatSession(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     title: Mapped[Optional[str]] = mapped_column(String(255))
+    current_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     total_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_cost: Mapped[Decimal] = mapped_column(
@@ -48,19 +49,24 @@ class ChatSession(Base):
     messages: Mapped[list["Message"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
-        order_by="Message.sequence_number",
+        order_by=lambda: (Message.generation, Message.sequence_number),
     )
     usage_records: Mapped[list["UsageRecord"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
-        order_by=lambda: (UsageRecord.created_at, UsageRecord.id),
+        order_by=lambda: (UsageRecord.generation, UsageRecord.created_at, UsageRecord.id),
     )
 
 
 class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
-        UniqueConstraint("session_id", "sequence_number", name="uq_messages_session_sequence"),
+        UniqueConstraint(
+            "session_id",
+            "generation",
+            "sequence_number",
+            name="uq_messages_session_generation_sequence",
+        ),
         Index("ix_messages_session_interaction", "session_id", "interaction_id"),
     )
 
@@ -70,6 +76,7 @@ class Message(Base):
         index=True,
     )
     interaction_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -80,6 +87,9 @@ class Message(Base):
 
 class UsageRecord(Base):
     __tablename__ = "usage_records"
+    __table_args__ = (
+        Index("ix_usage_records_session_generation", "session_id", "generation"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     session_id: Mapped[str] = mapped_column(
@@ -87,6 +97,7 @@ class UsageRecord(Base):
         index=True,
     )
     interaction_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
     cached_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

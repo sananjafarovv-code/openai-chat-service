@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from app.core.exceptions import SessionNotFoundError
+from app.core.exceptions import SessionGenerationConflictError, SessionNotFoundError
 from app.db.models import ChatSession, Message, UsageRecord
 from app.repositories.session_repository import SessionRepository
 from app.services.openai_client import ChatMessage, OpenAIChatClient
@@ -17,6 +17,13 @@ class Interaction:
     user_message: Message
     assistant_message: Message
     usage: UsageRecord
+
+
+@dataclass(frozen=True)
+class SessionDetails:
+    session: ChatSession
+    messages: list[Message]
+    usage_records: list[UsageRecord]
 
 
 class ChatService:
@@ -39,26 +46,53 @@ class ChatService:
         self._pricing_service.ensure_model_supported(selected_model)
         return self._repository.create(model=selected_model, title=title)
 
-    def get_session(self, session_id: str) -> ChatSession:
-        session = self._repository.get(session_id, with_details=True)
+    def get_session(self, session_id: str) -> SessionDetails:
+        session = self._repository.get(session_id)
         if session is None:
             raise SessionNotFoundError(session_id)
-        return session
+        return SessionDetails(
+            session=session,
+            messages=self._repository.list_messages(session_id, session.current_generation),
+            usage_records=self._repository.list_usage_records(
+                session_id,
+                session.current_generation,
+            ),
+        )
 
-    def send_message(self, session_id: str, content: str) -> Interaction:
+    def reset_session(self, session_id: str) -> ChatSession:
         with self._lock_manager.acquire(session_id):
-            return self._send_message_locked(session_id, content)
+            session = self._repository.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            return self._repository.reset(session)
 
-    def _send_message_locked(self, session_id: str, content: str) -> Interaction:
+    def send_message(
+        self,
+        session_id: str,
+        content: str,
+        model: Optional[str] = None,
+    ) -> Interaction:
+        with self._lock_manager.acquire(session_id):
+            return self._send_message_locked(session_id, content, model)
+
+    def _send_message_locked(
+        self,
+        session_id: str,
+        content: str,
+        requested_model: Optional[str],
+    ) -> Interaction:
         session = self._repository.get(session_id)
         if session is None:
             raise SessionNotFoundError(session_id)
 
-        history = self._repository.list_messages(session_id)
+        generation = session.current_generation
+        model = requested_model or session.model
+        self._pricing_service.ensure_model_supported(model)
+
+        history = self._repository.list_messages(session_id, generation)
         context = [ChatMessage(role=message.role, content=message.content) for message in history]
         context.append(ChatMessage(role="user", content=content))
 
-        model = session.model
         self._repository.end_read_transaction()
 
         openai_result = self._openai_client.generate(model, context)
@@ -73,9 +107,13 @@ class ChatService:
         session = self._repository.get(session_id)
         if session is None:
             raise SessionNotFoundError(session_id)
+        if session.current_generation != generation:
+            raise SessionGenerationConflictError(session_id)
 
         user_message, assistant_message, usage = self._repository.save_interaction(
             session=session,
+            generation=generation,
+            model=model,
             user_content=content,
             openai_result=openai_result,
             pricing=pricing,

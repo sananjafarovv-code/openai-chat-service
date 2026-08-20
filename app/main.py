@@ -14,6 +14,7 @@ from app.core.exceptions import (
     OpenAIServiceError,
     OpenAITimeoutError,
     PricingNotConfiguredError,
+    SessionGenerationConflictError,
     SessionNotFoundError,
 )
 
@@ -33,6 +34,17 @@ def handle_session_not_found(_: Request, exc: SessionNotFoundError) -> JSONRespo
 def handle_pricing_not_configured(_: Request, exc: PricingNotConfiguredError) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": str(exc)},
+    )
+
+
+@app.exception_handler(SessionGenerationConflictError)
+def handle_session_generation_conflict(
+    _: Request,
+    exc: SessionGenerationConflictError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
         content={"detail": str(exc)},
     )
 
