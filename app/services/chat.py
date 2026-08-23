@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from app.core.exceptions import SessionGenerationConflictError, SessionNotFoundError
+from app.core.exceptions import (
+    IdempotencyConflictError,
+    SessionGenerationConflictError,
+    SessionNotFoundError,
+)
 from app.db.models import ChatSession, Message, UsageRecord
 from app.repositories.session_repository import SessionRepository
 from app.services.openai_client import ChatMessage, OpenAIChatClient
@@ -17,6 +21,7 @@ class Interaction:
     user_message: Message
     assistant_message: Message
     usage: UsageRecord
+    idempotency_replayed: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,15 +76,22 @@ class ChatService:
         session_id: str,
         content: str,
         model: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Interaction:
         with self._lock_manager.acquire(session_id):
-            return self._send_message_locked(session_id, content, model)
+            return self._send_message_locked(
+                session_id,
+                content,
+                model,
+                idempotency_key,
+            )
 
     def _send_message_locked(
         self,
         session_id: str,
         content: str,
         requested_model: Optional[str],
+        idempotency_key: Optional[str],
     ) -> Interaction:
         session = self._repository.get(session_id)
         if session is None:
@@ -88,6 +100,16 @@ class ChatService:
         generation = session.current_generation
         model = requested_model or session.model
         self._pricing_service.ensure_model_supported(model)
+
+        if idempotency_key is not None:
+            replay = self._get_idempotent_replay(
+                session=session,
+                content=content,
+                model=model,
+                idempotency_key=idempotency_key,
+            )
+            if replay is not None:
+                return replay
 
         history = self._repository.list_messages(session_id, generation)
         context = [ChatMessage(role=message.role, content=message.content) for message in history]
@@ -114,6 +136,7 @@ class ChatService:
             session=session,
             generation=generation,
             model=model,
+            idempotency_key=idempotency_key,
             user_content=content,
             openai_result=openai_result,
             pricing=pricing,
@@ -124,4 +147,44 @@ class ChatService:
             user_message=user_message,
             assistant_message=assistant_message,
             usage=usage,
+        )
+
+    def _get_idempotent_replay(
+        self,
+        session: ChatSession,
+        content: str,
+        model: str,
+        idempotency_key: str,
+    ) -> Optional[Interaction]:
+        usage = self._repository.get_usage_by_idempotency_key(
+            session_id=session.id,
+            generation=session.current_generation,
+            idempotency_key=idempotency_key,
+        )
+        if usage is None:
+            return None
+
+        messages = self._repository.list_interaction_messages(
+            session_id=session.id,
+            interaction_id=usage.interaction_id,
+        )
+        user_message = next(
+            (message for message in messages if message.role == "user"),
+            None,
+        )
+        assistant_message = next(
+            (message for message in messages if message.role == "assistant"),
+            None,
+        )
+        if user_message is None or assistant_message is None:
+            raise RuntimeError("Stored idempotent interaction is incomplete.")
+        if user_message.content != content or usage.model != model:
+            raise IdempotencyConflictError(idempotency_key)
+
+        return Interaction(
+            session=session,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            usage=usage,
+            idempotency_replayed=True,
         )

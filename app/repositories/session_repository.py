@@ -53,6 +53,34 @@ class SessionRepository:
         )
         return list(self._db.scalars(statement))
 
+    def get_usage_by_idempotency_key(
+        self,
+        session_id: str,
+        generation: int,
+        idempotency_key: str,
+    ) -> Optional[UsageRecord]:
+        statement = select(UsageRecord).where(
+            UsageRecord.session_id == session_id,
+            UsageRecord.generation == generation,
+            UsageRecord.idempotency_key == idempotency_key,
+        )
+        return self._db.scalar(statement)
+
+    def list_interaction_messages(
+        self,
+        session_id: str,
+        interaction_id: str,
+    ) -> list[Message]:
+        statement = (
+            select(Message)
+            .where(
+                Message.session_id == session_id,
+                Message.interaction_id == interaction_id,
+            )
+            .order_by(Message.sequence_number)
+        )
+        return list(self._db.scalars(statement))
+
     def end_read_transaction(self) -> None:
         """Release the database connection before a slow external API call."""
         self._db.rollback()
@@ -79,6 +107,7 @@ class SessionRepository:
         session: ChatSession,
         generation: int,
         model: str,
+        idempotency_key: Optional[str],
         user_content: str,
         openai_result: OpenAIResult,
         pricing: PricingBreakdown,
@@ -112,6 +141,7 @@ class SessionRepository:
             session_id=session.id,
             interaction_id=interaction_id,
             generation=generation,
+            idempotency_key=idempotency_key,
             model=model,
             input_tokens=openai_result.input_tokens,
             cached_input_tokens=openai_result.cached_input_tokens,

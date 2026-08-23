@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.api.routes.sessions import router as sessions_router
 from app.core.config import get_settings
 from app.core.exceptions import (
+    IdempotencyConflictError,
     OpenAIConfigurationError,
     OpenAIConnectionError,
     OpenAIQuotaError,
@@ -42,6 +43,17 @@ def handle_pricing_not_configured(_: Request, exc: PricingNotConfiguredError) ->
 def handle_session_generation_conflict(
     _: Request,
     exc: SessionGenerationConflictError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={"detail": str(exc)},
+    )
+
+
+@app.exception_handler(IdempotencyConflictError)
+def handle_idempotency_conflict(
+    _: Request,
+    exc: IdempotencyConflictError,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,

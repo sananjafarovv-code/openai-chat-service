@@ -51,6 +51,7 @@ class UsageRead(BaseModel):
     id: str
     interaction_id: str
     generation: int
+    idempotency_key: Optional[str]
     model: str
     input_tokens: int
     cached_input_tokens: int
@@ -83,3 +84,4 @@ class InteractionResponse(BaseModel):
     user_message: MessageRead
     assistant_message: MessageRead
     usage: UsageRead
+    idempotency_replayed: bool

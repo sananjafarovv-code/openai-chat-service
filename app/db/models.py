@@ -88,6 +88,12 @@ class Message(Base):
 class UsageRecord(Base):
     __tablename__ = "usage_records"
     __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "generation",
+            "idempotency_key",
+            name="uq_usage_records_session_generation_idempotency_key",
+        ),
         Index("ix_usage_records_session_generation", "session_id", "generation"),
     )
 
@@ -98,6 +104,7 @@ class UsageRecord(Base):
     )
     interaction_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(100))
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
     cached_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

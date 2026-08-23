@@ -25,6 +25,15 @@ class SessionGenerationConflictError(ApplicationError):
         )
 
 
+class IdempotencyConflictError(ApplicationError):
+    """Raised when an idempotency key is reused for a different request."""
+
+    def __init__(self, idempotency_key: str) -> None:
+        super().__init__(
+            f"Idempotency key '{idempotency_key}' was already used for a different request."
+        )
+
+
 class OpenAIConfigurationError(ApplicationError):
     """Raised when the OpenAI client cannot be configured."""
 

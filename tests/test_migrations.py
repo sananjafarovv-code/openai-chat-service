@@ -75,11 +75,21 @@ def test_migrations_build_current_schema_from_scratch(
     assert {
         "interaction_id",
         "generation",
+        "idempotency_key",
         "cached_input_tokens",
         "cache_write_tokens",
         "reasoning_tokens",
         "long_context_applied",
     }.issubset(usage_columns)
+    usage_unique_constraints = {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints("usage_records")
+    }
+    assert (
+        "session_id",
+        "generation",
+        "idempotency_key",
+    ) in usage_unique_constraints
 
     with engine.connect() as connection:
         message_interactions = list(
@@ -138,6 +148,9 @@ def test_migrations_build_current_schema_from_scratch(
         )
 
     command.downgrade(config, "0002_usage_cache_and_interactions")
+    assert "idempotency_key" not in {
+        column["name"] for column in inspect(engine).get_columns("usage_records")
+    }
     with engine.connect() as connection:
         legacy_sequences = list(
             connection.execute(

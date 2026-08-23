@@ -213,6 +213,221 @@ def test_blank_message_model_returns_422(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_idempotency_key_replays_interaction_without_new_openai_call(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+) -> None:
+    session_id = create_session(client)
+    headers = {"Idempotency-Key": "message-request-1"}
+
+    first = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Process this once"},
+        headers=headers,
+    )
+    replay = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Process this once"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert first.json()["idempotency_replayed"] is False
+    assert replay.json()["idempotency_replayed"] is True
+    assert replay.json()["usage"]["idempotency_key"] == "message-request-1"
+    assert replay.json()["usage"]["id"] == first.json()["usage"]["id"]
+    assert replay.json()["user_message"]["id"] == first.json()["user_message"]["id"]
+    assert replay.json()["assistant_message"]["id"] == first.json()["assistant_message"]["id"]
+    assert len(fake_openai.calls) == 1
+
+    detail = client.get(f"/sessions/{session_id}").json()
+    assert len(detail["messages"]) == 2
+    assert len(detail["usage_records"]) == 1
+    assert detail["total_cost"] == first.json()["session"]["total_cost"]
+
+
+@pytest.mark.parametrize(
+    "second_payload",
+    [
+        {"content": "Different content"},
+        {"content": "Original content", "model": "gpt-5.6-terra"},
+    ],
+)
+def test_idempotency_key_reuse_for_different_request_returns_409(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+    second_payload: dict[str, str],
+) -> None:
+    session_id = create_session(client)
+    headers = {"Idempotency-Key": "conflicting-request"}
+    first = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Original content"},
+        headers=headers,
+    )
+
+    conflict = client.post(
+        f"/sessions/{session_id}/messages",
+        json=second_payload,
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert "already used for a different request" in conflict.json()["detail"]
+    assert len(fake_openai.calls) == 1
+    detail = client.get(f"/sessions/{session_id}").json()
+    assert len(detail["messages"]) == 2
+    assert len(detail["usage_records"]) == 1
+
+
+def test_idempotency_key_can_be_reused_after_openai_failure(client: TestClient) -> None:
+    session_id = create_session(client)
+
+    class FailsOnceOpenAIClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, model: str, messages: list[ChatMessage]) -> OpenAIResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise OpenAIServiceError("Simulated first-attempt failure.")
+            return OpenAIResult(
+                content="successful retry",
+                response_id="successful_retry",
+                input_tokens=10,
+                output_tokens=5,
+                total_tokens=15,
+            )
+
+    fails_once = FailsOnceOpenAIClient()
+    app.dependency_overrides[get_openai_client] = lambda: fails_once
+    headers = {"Idempotency-Key": "retry-after-failure"}
+
+    failed = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Retry me"},
+        headers=headers,
+    )
+    succeeded = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Retry me"},
+        headers=headers,
+    )
+    replay = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Retry me"},
+        headers=headers,
+    )
+
+    assert failed.status_code == 502
+    assert succeeded.status_code == 200
+    assert succeeded.json()["idempotency_replayed"] is False
+    assert replay.status_code == 200
+    assert replay.json()["idempotency_replayed"] is True
+    assert fails_once.calls == 2
+
+
+def test_idempotency_key_is_scoped_to_active_generation(
+    client: TestClient,
+    fake_openai: FakeOpenAIClient,
+) -> None:
+    session_id = create_session(client)
+    headers = {"Idempotency-Key": "generation-local-key"}
+
+    first = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Before reset"},
+        headers=headers,
+    )
+    reset = client.post(f"/sessions/{session_id}/reset")
+    second = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "After reset"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert reset.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["idempotency_replayed"] is False
+    assert second.json()["usage"]["generation"] == 2
+    assert len(fake_openai.calls) == 2
+
+
+def test_invalid_idempotency_key_returns_422(client: TestClient) -> None:
+    session_id = create_session(client)
+
+    response = client.post(
+        f"/sessions/{session_id}/messages",
+        json={"content": "Do not process"},
+        headers={"Idempotency-Key": "invalid key with spaces"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_concurrent_duplicate_idempotency_key_is_processed_once(
+    client: TestClient,
+) -> None:
+    session_id = create_session(client)
+
+    class BlockingOpenAIClient:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+            self.calls = 0
+
+        def generate(self, model: str, messages: list[ChatMessage]) -> OpenAIResult:
+            self.calls += 1
+            self.started.set()
+            if not self.release.wait(timeout=3):
+                raise RuntimeError("Idempotency concurrency test timed out.")
+            return OpenAIResult(
+                content="processed once",
+                response_id="processed_once",
+                input_tokens=10,
+                output_tokens=5,
+                total_tokens=15,
+            )
+
+    blocking_openai = BlockingOpenAIClient()
+    app.dependency_overrides[get_openai_client] = lambda: blocking_openai
+    headers = {"Idempotency-Key": "concurrent-duplicate"}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            client.post,
+            f"/sessions/{session_id}/messages",
+            json={"content": "Only once"},
+            headers=headers,
+        )
+        assert blocking_openai.started.wait(timeout=2)
+        second_future = executor.submit(
+            client.post,
+            f"/sessions/{session_id}/messages",
+            json={"content": "Only once"},
+            headers=headers,
+        )
+
+        time.sleep(0.1)
+        assert blocking_openai.calls == 1
+        blocking_openai.release.set()
+        responses = [
+            first_future.result(timeout=3),
+            second_future.result(timeout=3),
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert sorted(response.json()["idempotency_replayed"] for response in responses) == [
+        False,
+        True,
+    ]
+    assert responses[0].json()["usage"]["id"] == responses[1].json()["usage"]["id"]
+    assert blocking_openai.calls == 1
+
+
 def test_reset_starts_clean_generation_and_preserves_archived_data(
     client: TestClient,
     fake_openai: FakeOpenAIClient,

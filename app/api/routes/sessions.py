@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, status
+from typing import Annotated, Optional
+
+from fastapi import APIRouter, Depends, Header, status
 
 from app.api.dependencies import get_chat_service
 from app.schemas.message import MessageCreate, MessageRead
@@ -27,18 +29,29 @@ def create_session(
 def send_message(
     session_id: str,
     payload: MessageCreate,
+    idempotency_key: Annotated[
+        Optional[str],
+        Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=100,
+            pattern=r"^[A-Za-z0-9._:-]+$",
+        ),
+    ] = None,
     service: ChatService = Depends(get_chat_service),
 ) -> InteractionResponse:
     interaction = service.send_message(
         session_id=session_id,
         content=payload.content,
         model=payload.model,
+        idempotency_key=idempotency_key,
     )
     return InteractionResponse(
         session=SessionSummary.model_validate(interaction.session),
         user_message=interaction.user_message,
         assistant_message=interaction.assistant_message,
         usage=interaction.usage,
+        idempotency_replayed=interaction.idempotency_replayed,
     )
 
 
